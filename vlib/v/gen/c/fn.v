@@ -1371,6 +1371,7 @@ fn (mut g Gen) gen_anon_fn(mut node ast.AnonFn) {
 			} else {
 				mut is_auto_heap := false
 				mut field_name := ''
+				mut is_inline_st := false
 				if obj := node.decl.scope.parent.find(var.name) {
 					if obj is ast.Var {
 						is_auto_heap = !obj.is_stack_obj && obj.is_auto_heap
@@ -1378,12 +1379,14 @@ fn (mut g Gen) gen_anon_fn(mut node ast.AnonFn) {
 							if g.table.type_kind(obj.typ) == .sum_type {
 								cast_sym := g.table.sym(obj.smartcasts.last())
 								field_name += '._${cast_sym.cname}'
+								is_inline_st = g.is_inline_sumtype(obj.typ)
 							}
 						}
 					}
 				}
 				if (is_auto_heap && !is_ptr) || field_name != '' {
-					g.writeln('.${var_name} = *${var_name}${field_name},')
+					deref := if field_name != '' && is_inline_st { '' } else { '*' }
+					g.writeln('.${var_name} = ${deref}${var_name}${field_name},')
 				} else {
 					g.writeln('.${var_name} = ${var_name},')
 				}
@@ -4813,16 +4816,30 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 					}
 				}
 				if smartcast_types.len > 0 && is_cast_needed {
-					for typ in smartcast_types {
+					for i, typ in smartcast_types {
 						sym := g.table.sym(g.unwrap_generic(typ))
+						container_type := if i == 0 {
+							obj.orig_type
+						} else {
+							smartcast_types[i - 1]
+						}
+						is_inline_st := g.is_inline_sumtype(container_type)
 						if obj.orig_type.has_flag(.option) && sym.kind == .function {
 							g.write('(*(${sym.cname}*)(')
+						} else if is_inline_st {
+							g.write('(')
 						} else {
 							g.write('(*(${sym.cname})(')
 						}
 					}
 					for i, typ in smartcast_types {
 						cast_sym := g.table.sym(g.unwrap_generic(typ))
+						container_type := if i == 0 {
+							obj.orig_type
+						} else {
+							smartcast_types[i - 1]
+						}
+						is_inline_st := g.is_inline_sumtype(container_type)
 						mut is_ptr := false
 						if i == 0 {
 							if obj.is_inherited {
@@ -4843,7 +4860,11 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 						} else {
 							g.write('${dot}_${cast_sym.cname}')
 						}
-						g.write('))')
+						if is_inline_st {
+							g.write(')')
+						} else {
+							g.write('))')
+						}
 					}
 					is_fn_var = true
 				} else if obj.is_inherited {

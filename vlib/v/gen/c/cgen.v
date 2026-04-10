@@ -3401,11 +3401,19 @@ fn (mut g Gen) write_sumtype_casting_fn(fun SumtypeCastingFn) {
 	mut type_idx := g.type_sidx(got)
 	mut sb := strings.new_builder(128)
 	mut variant_name := g.get_sumtype_variant_name(got, got_sym)
+	exp_info := exp_sym.info as ast.SumType
+	is_inline := exp_info.is_inline_storage
 	if got_sym.kind == .alias && got_sym.info is ast.Alias
 		&& g.table.unaliased_type(got).idx() == exp.idx() {
-		g.definitions.writeln('${exp_cname} ${fun.fn_name}(${got_cname}* x, bool is_mut);')
-		sb.writeln('${exp_cname} ${fun.fn_name}(${got_cname}* x, bool is_mut) {')
-		sb.writeln('\treturn *(${exp_cname}*)x;')
+		if is_inline {
+			g.definitions.writeln('${exp_cname} ${fun.fn_name}(${got_cname} x);')
+			sb.writeln('${exp_cname} ${fun.fn_name}(${got_cname} x) {')
+			sb.writeln('\treturn *(${exp_cname}*)&x;')
+		} else {
+			g.definitions.writeln('${exp_cname} ${fun.fn_name}(${got_cname}* x, bool is_mut);')
+			sb.writeln('${exp_cname} ${fun.fn_name}(${got_cname}* x, bool is_mut) {')
+			sb.writeln('\treturn *(${exp_cname}*)x;')
+		}
 		sb.writeln('}\n')
 		g.auto_fn_definitions << sb.str()
 		return
@@ -3414,7 +3422,6 @@ fn (mut g Gen) write_sumtype_casting_fn(fun SumtypeCastingFn) {
 		got_name := 'fn ${g.table.fn_type_source_signature(got_sym.info.func)}'
 		got_cname = 'anon_fn_${g.table.fn_type_signature(got_sym.info.func)}'
 		type_idx = g.table.type_idxs[got_name].str()
-		exp_info := exp_sym.info as ast.SumType
 		for variant in exp_info.variants {
 			variant_sym := g.table.sym(variant)
 			if variant_sym.info is ast.FnType {
@@ -3428,52 +3435,87 @@ fn (mut g Gen) write_sumtype_casting_fn(fun SumtypeCastingFn) {
 		}
 		sb.writeln('static inline ${exp_cname} ${fun.fn_name}(${got_cname} x) {')
 		sb.writeln('\t${got_cname} ptr = x;')
+	} else if is_inline {
+		g.definitions.writeln('${exp_cname} ${fun.fn_name}(${got_cname} x);')
+		sb.writeln('${exp_cname} ${fun.fn_name}(${got_cname} x) {')
 	} else {
-		// g.definitions.writeln('${g.static_modifier} inline ${exp_cname} ${fun.fn_name}(${got_cname}* x);')
-		// sb.writeln('${g.static_modifier} inline ${exp_cname} ${fun.fn_name}(${got_cname}* x) {')
 		g.definitions.writeln('${exp_cname} ${fun.fn_name}(${got_cname}* x, bool is_mut);')
 		sb.writeln('${exp_cname} ${fun.fn_name}(${got_cname}* x, bool is_mut) {')
 		sb.writeln('\t${got_cname}* ptr = x;')
 		sb.writeln('\tif (!is_mut) { ptr = builtin__memdup(x, sizeof(${got_cname})); }')
 	}
-	for embed_hierarchy in g.table.get_embeds(got_sym) {
-		// last embed in the hierarchy
-		mut embed_cname := ''
-		mut embed_name := ''
-		mut accessor := '&x->'
-		for j, embed in embed_hierarchy {
-			embed_sym := g.table.sym(embed)
-			embed_cname = embed_sym.cname
-			embed_name = embed_sym.embed_name()
-			if j > 0 {
-				accessor += '.'
+	if is_inline {
+		// Inline storage: no memdup, no embed pointer duplication
+		if exp_info.fields.len > 0 {
+			// Need two-step form to take addresses of inline fields
+			sb.writeln('\t${exp_cname} _result;')
+			sb.writeln('\t_result._${variant_name} = x;')
+			sb.writeln('\t_result._typ = ${type_idx};')
+			for field in exp_info.fields {
+				mut accessor := '_result._${variant_name}'
+				mut type_cname := got_cname
+				_, embed_types := g.table.find_field_from_embeds(got_sym, field.name) or {
+					ast.StructField{}, []ast.Type{}
+				}
+				if embed_types.len > 0 {
+					for embed_type in embed_types {
+						embed_sym := g.table.sym(embed_type)
+						accessor += '.${embed_sym.embed_name()}'
+					}
+				}
+				field_styp := g.styp(field.typ)
+				if got_sym.kind in [.sum_type, .interface] {
+					sb.writeln('\t_result.${c_name(field.name)} = ${accessor}.${field.name};')
+				} else {
+					sb.writeln('\t_result.${c_name(field.name)} = (${field_styp}*)((char*)&${accessor} + __offsetof(${type_cname}, ${c_name(field.name)}));')
+				}
 			}
-			accessor += embed_name
-		}
-		// if the variable is not used, the C compiler will optimize it away
-		sb.writeln('\t${embed_cname}* ${embed_name}_ptr = builtin__memdup(${accessor}, sizeof(${embed_cname}));')
-	}
-	sb.write_string('\treturn (${exp_cname}){ ._${variant_name} = ptr, ._typ = ${type_idx}')
-	for field in (exp_sym.info as ast.SumType).fields {
-		mut ptr := 'ptr'
-		mut type_cname := got_cname
-		_, embed_types := g.table.find_field_from_embeds(got_sym, field.name) or {
-			ast.StructField{}, []ast.Type{}
-		}
-		if embed_types.len > 0 {
-			embed_sym := g.table.sym(embed_types.last())
-			ptr = '${embed_sym.embed_name()}_ptr'
-			type_cname = embed_sym.cname
-		}
-		field_styp := g.styp(field.typ)
-		if got_sym.kind in [.sum_type, .interface] {
-			// the field is already a wrapped pointer; we shouldn't wrap it once again
-			sb.write_string(', .${c_name(field.name)} = ptr->${field.name}')
+			sb.writeln('\treturn _result;')
 		} else {
-			sb.write_string(', .${c_name(field.name)} = (${field_styp}*)((char*)${ptr} + __offsetof_ptr(${ptr}, ${type_cname}, ${c_name(field.name)}))')
+			sb.write_string('\treturn (${exp_cname}){ ._${variant_name} = x, ._typ = ${type_idx}')
+			sb.writeln('};')
 		}
+	} else {
+		for embed_hierarchy in g.table.get_embeds(got_sym) {
+			// last embed in the hierarchy
+			mut embed_cname := ''
+			mut embed_name := ''
+			mut accessor := '&x->'
+			for j, embed in embed_hierarchy {
+				embed_sym := g.table.sym(embed)
+				embed_cname = embed_sym.cname
+				embed_name = embed_sym.embed_name()
+				if j > 0 {
+					accessor += '.'
+				}
+				accessor += embed_name
+			}
+			// if the variable is not used, the C compiler will optimize it away
+			sb.writeln('\t${embed_cname}* ${embed_name}_ptr = builtin__memdup(${accessor}, sizeof(${embed_cname}));')
+		}
+		sb.write_string('\treturn (${exp_cname}){ ._${variant_name} = ptr, ._typ = ${type_idx}')
+		for field in exp_info.fields {
+			mut ptr := 'ptr'
+			mut type_cname := got_cname
+			_, embed_types := g.table.find_field_from_embeds(got_sym, field.name) or {
+				ast.StructField{}, []ast.Type{}
+			}
+			if embed_types.len > 0 {
+				embed_sym := g.table.sym(embed_types.last())
+				ptr = '${embed_sym.embed_name()}_ptr'
+				type_cname = embed_sym.cname
+			}
+			field_styp := g.styp(field.typ)
+			if got_sym.kind in [.sum_type, .interface] {
+				// the field is already a wrapped pointer; we shouldn't wrap it once again
+				sb.write_string(', .${c_name(field.name)} = ptr->${field.name}')
+			} else {
+				sb.write_string(', .${c_name(field.name)} = (${field_styp}*)((char*)${ptr} + __offsetof_ptr(${ptr}, ${type_cname}, ${c_name(field.name)}))')
+			}
+		}
+		sb.writeln('};')
 	}
-	sb.writeln('};\n}')
+	sb.writeln('}')
 	g.auto_fn_definitions << sb.str()
 }
 
@@ -3483,6 +3525,17 @@ fn (g &Gen) can_reuse_sumtype_variant_storage(exp ast.Type, got_is_ptr bool) boo
 	// When expected_arg_mut is set, the caller wraps with ADDR() and passes back a pointer,
 	// so the variant storage can be reused (no copy needed).
 	return g.expected_arg_mut || (exp.is_ptr() && (got_is_ptr || g.expected_arg_mut))
+}
+
+// is_inline_sumtype returns true if the given type is a sum type that uses inline (by-value)
+// storage in its C union rather than pointer-based (heap-allocated) storage.
+@[inline]
+fn (g &Gen) is_inline_sumtype(typ ast.Type) bool {
+	sym := g.table.sym(typ)
+	if sym.info is ast.SumType {
+		return sym.info.is_inline_storage
+	}
+	return false
 }
 
 fn (g &Gen) interface_expr_needs_heap(expr ast.Expr) bool {
@@ -3559,6 +3612,7 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 	is_interface_cast := !got_is_fn && fname.contains('_to_Interface_')
 	is_comptime_variant := is_not_ptr_and_fn && expr is ast.Ident
 		&& g.comptime.is_comptime_variant_var(expr)
+	is_inline_sumtype := is_sumtype_cast && g.is_inline_sumtype(exp)
 	if exp.is_ptr() {
 		if (expr is ast.UnsafeExpr && expr.expr is ast.Nil) || got == ast.nil_type {
 			g.write('(void*)0')
@@ -3582,7 +3636,9 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 		// local variables or fields on by-value fn args (`p.email`).
 		is_stack_rooted_interface_expr := is_interface_cast && g.interface_expr_needs_heap(expr)
 
-		if !is_cast_fixed_array_init && (is_comptime_variant || !expr.is_lvalue()
+		if is_inline_sumtype {
+			// Inline sumtype: pass by value, no ADDR/HEAP wrapping needed
+		} else if !is_cast_fixed_array_init && (is_comptime_variant || !expr.is_lvalue()
 			|| (expr is ast.Ident && (expr.obj.is_simple_define_const()
 			|| (expr.obj is ast.Var && expr.obj.is_index_var)))
 			|| is_primitive_to_interface || is_stack_rooted_interface_expr) {
@@ -3604,7 +3660,9 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 				rparen_n += 2
 			}
 		} else {
-			g.write('&')
+			if !is_inline_sumtype {
+				g.write('&')
+			}
 		}
 	}
 	if got_styp == 'none' && !g.cur_fn.return_type.has_flag(.option) {
@@ -3614,6 +3672,11 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 			ast.void_type)
 		g.write(g.type_default(ctyp))
 	} else {
+		// When the source is a pointer but the target inline sum type expects a value,
+		// dereference the pointer before passing it to the casting function.
+		if got_is_ptr && is_inline_sumtype {
+			g.write('*')
+		}
 		old_inside_sumtype_cast := g.inside_sumtype_cast
 		g.inside_sumtype_cast = true
 		old_left_is_opt := g.left_is_opt
@@ -3622,7 +3685,7 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 		g.left_is_opt = old_left_is_opt
 		g.inside_sumtype_cast = old_inside_sumtype_cast
 	}
-	if is_sumtype_cast {
+	if is_sumtype_cast && !is_inline_sumtype {
 		// the `_to_sumtype_` family of functions last `is_mut` param
 		g.write(')'.repeat(rparen_n - mutable_is_mut_arg_pos))
 		g.write(', ${g.can_reuse_sumtype_variant_storage(exp, got_is_ptr)}')
@@ -3943,8 +4006,12 @@ fn (mut g Gen) expr_with_cast(expr ast.Expr, got_type_raw ast.Type, expected_typ
 					g.expr(expr)
 					g.writeln(';')
 					g.write2(stmt_str, ' ')
-					g.write('${fname}(&${tmp_var}, ${g.can_reuse_sumtype_variant_storage(unwrapped_expected_type,
-						got_is_ptr)})')
+					if g.is_inline_sumtype(unwrapped_expected_type) {
+						g.write('${fname}(${tmp_var})')
+					} else {
+						g.write('${fname}(&${tmp_var}, ${g.can_reuse_sumtype_variant_storage(unwrapped_expected_type,
+							got_is_ptr)})')
+					}
 					return
 				} else {
 					g.call_cfn_for_casting_expr(fname, expr, expected_type, sumtype_got_type,
@@ -5598,7 +5665,10 @@ fn (mut g Gen) selector_expr(node ast.SelectorExpr) {
 							g.write('(')
 						}
 						if field_sym.kind == .sum_type && !is_option {
-							g.write('*')
+							if !(field_sym.info is ast.SumType
+								&& field_sym.info.is_inline_storage) {
+								g.write('*')
+							}
 						}
 						cast_sym := g.table.sym(g.unwrap_generic(typ))
 						if field_sym.kind == .interface && cast_sym.kind == .interface
@@ -6194,7 +6264,9 @@ fn (mut g Gen) debugger_stmt(node ast.DebuggerStmt) {
 					} else {
 						g.get_str_fn(var_typ)
 					}
-					if obj.smartcasts.len > 1 && obj_sym.kind == .sum_type {
+					is_dbg_inline_st := obj_sym.info is ast.SumType
+						&& obj_sym.info.is_inline_storage
+					if obj.smartcasts.len > 1 && obj_sym.kind == .sum_type && !is_dbg_inline_st {
 						param_var.write_string('*(')
 					}
 					param_var.write_string('(')
@@ -6204,9 +6276,11 @@ fn (mut g Gen) debugger_stmt(node ast.DebuggerStmt) {
 								param_var.write_string('*(')
 							}
 							styp := g.base_type(obj.typ)
-							param_var.write_string('*(${styp}*)')
+							if !is_dbg_inline_st {
+								param_var.write_string('*(${styp}*)')
+							}
 							opt_cast = true
-						} else {
+						} else if !is_dbg_inline_st {
 							param_var.write_string('*')
 						}
 					} else if g.table.is_interface_var(obj) || obj.ct_type_var == .smartcast {
@@ -7188,10 +7262,24 @@ fn (mut g Gen) ident(node ast.Ident) {
 					if unwrap_sumtype {
 						g.write('(*(')
 					}
+					// Whether the sum type smartcast path can use inline storage
+					is_sum_inline_eligible := obj_sym.kind == .sum_type
+						&& !is_auto_heap && !is_option && !g.arg_no_auto_deref
 					for i, typ in smartcast_types {
 						is_option_unwrap := i == 0 && is_option
 							&& typ == resolved_var.orig_type.clear_flag(.option)
-						g.write('(')
+						// For inline sum type containers, variants are stored
+						// by value in the union, so we skip both the opening
+						// paren and the dereference operator.
+						is_inline_container := is_sum_inline_eligible
+							&& g.is_inline_sumtype(if i == 0 {
+							resolved_var.orig_type
+						} else {
+							smartcast_types[i - 1]
+						})
+						if !is_inline_container {
+							g.write('(')
+						}
 						if i == 0 && resolved_var.is_unwrapped
 							&& resolved_var.ct_type_var == .smartcast {
 							ctyp := g.unwrap_generic(g.type_resolver.get_type(node))
@@ -7206,7 +7294,7 @@ fn (mut g Gen) ident(node ast.Ident) {
 									styp := g.base_type(resolved_var.typ)
 									g.write('*(${styp}*)')
 								}
-							} else if !g.arg_no_auto_deref {
+							} else if !g.arg_no_auto_deref && !is_inline_container {
 								g.write('*')
 							}
 						} else if interface_var_needs_deref
@@ -7224,6 +7312,12 @@ fn (mut g Gen) ident(node ast.Ident) {
 					}
 					for i, typ in smartcast_types {
 						is_option_unwrap := is_option && typ == resolved_var.typ.clear_flag(.option)
+						is_inline_container := is_sum_inline_eligible
+							&& g.is_inline_sumtype(if i == 0 {
+							resolved_var.orig_type
+						} else {
+							smartcast_types[i - 1]
+						})
 						cast_sym := g.table.sym(g.unwrap_generic(typ))
 						if obj_sym.kind == .interface && cast_sym.kind == .interface {
 							if cast_sym.cname != obj_sym.cname {
@@ -7300,7 +7394,9 @@ fn (mut g Gen) ident(node ast.Ident) {
 								g.write('.data')
 							}
 						}
-						g.write(')')
+						if !is_inline_container {
+							g.write(')')
+						}
 					}
 					if emit_auto_heap_deref {
 						g.write('))')
@@ -8855,6 +8951,8 @@ fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
 				}
 				mut sumtype_sym := g.table.sym(ast.idx_to_type(sym.idx))
 				g.table.resolve_common_sumtype_fields(mut sumtype_sym)
+				g.table.resolve_sumtype_storage_mode(mut sumtype_sym)
+				is_inline := (sumtype_sym.info as ast.SumType).is_inline_storage
 				struct_names[name] = true
 				g.typedefs.writeln('typedef struct ${name} ${name};')
 				mut idxs := []ast.Type{}
@@ -8879,7 +8977,13 @@ fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
 					}
 					idxs << variant
 					variant_sym := g.table.sym(variant)
-					mut var := if variant.has_flag(.option) { variant } else { variant.ref() }
+					mut var := if variant.has_flag(.option) {
+						variant
+					} else if is_inline {
+						variant // inline storage: store value directly
+					} else {
+						variant.ref() // pointer-based storage
+					}
 					variant_name := g.get_sumtype_variant_name(variant, variant_sym)
 					if variant_sym.info is ast.FnType {
 						if variant_sym.info.is_anon {
@@ -9078,8 +9182,21 @@ fn (mut g Gen) sort_structs(typesa []&ast.TypeSymbol) []&ast.TypeSymbol {
 				}
 			}
 			ast.SumType {
+				// Resolve inline storage mode early, during sorting, so dependencies are correct.
+				if !sym.info.is_inline_storage {
+					mut st_sym := g.table.sym(ast.idx_to_type(sym.idx))
+					g.table.resolve_sumtype_storage_mode(mut st_sym)
+				}
 				for variant in sym.info.variants {
 					vsym := g.table.sym(variant)
+					// For inline storage, variant types must be fully defined before the sum type.
+					if (g.table.sym(ast.idx_to_type(sym.idx)).info as ast.SumType).is_inline_storage
+						&& !variant.has_flag(.option) {
+						dep := vsym.scoped_name()
+						if dep in type_names && dep !in field_deps {
+							field_deps << dep
+						}
+					}
 					if vsym.info !is ast.Struct {
 						continue
 					}
@@ -9439,7 +9556,9 @@ fn (mut g Gen) type_default_sumtype(typ_ ast.Type, sym ast.TypeSymbol) string {
 	if typ_.has_flag(.option) {
 		return '(${g.styp(typ_)}){.state=2, .err=_const_none__, .data={E_STRUCT}}'
 	}
-	first_typ := g.unwrap_generic((sym.info as ast.SumType).variants[0])
+	sumtype_info := sym.info as ast.SumType
+	is_inline := sumtype_info.is_inline_storage
+	first_typ := g.unwrap_generic(sumtype_info.variants[0])
 	first_sym := g.table.sym(first_typ)
 	first_styp := g.styp(first_typ)
 	first_field := g.get_sumtype_variant_name(first_typ, first_sym)
@@ -9449,6 +9568,13 @@ fn (mut g Gen) type_default_sumtype(typ_ ast.Type, sym ast.TypeSymbol) string {
 		'{E_STRUCT}'
 	} else {
 		g.type_default_no_sumtype(first_typ)
+	}
+	if is_inline {
+		if default_str[0] == `{` {
+			return '(${g.styp(typ_)}){._${first_field}=((${first_styp})${default_str}),._typ=${u32(first_typ)}}'
+		} else {
+			return '(${g.styp(typ_)}){._${first_field}=(${default_str}),._typ=${u32(first_typ)}}'
+		}
 	}
 	if default_str[0] == `{` {
 		return '(${g.styp(typ_)}){._${first_field}=HEAP(${first_styp}, ((${first_styp})${default_str})),._typ=${u32(first_typ)}}'
@@ -9794,6 +9920,7 @@ fn (mut g Gen) as_cast(node ast.AsCast) {
 	if mut expr_type_sym.info is ast.SumType {
 		dot := if node.expr_type.is_ptr() { '->' } else { '.' }
 		if node.expr.has_fn_call() && !g.is_cc_msvc {
+			is_inline_st_fn := expr_type_sym.info.is_inline_storage
 			tmp_var := g.new_tmp_var()
 			expr_styp := g.styp(node.expr_type)
 			g.write('({ ${expr_styp} ${tmp_var} = ')
@@ -9806,12 +9933,16 @@ fn (mut g Gen) as_cast(node ast.AsCast) {
 			} else {
 				g.write('*(${styp}*)builtin____as_cast(')
 			}
+			if is_inline_st_fn {
+				g.write('&')
+			}
 			g.write2(tmp_var, dot)
 			g.write2('_${sym.cname},', tmp_var)
 			g.write(dot)
 			sidx := g.type_sidx(unwrapped_node_typ)
 			g.write('_typ, ${sidx}); })')
 		} else {
+			is_inline_st := expr_type_sym.info.is_inline_storage
 			if sym.info is ast.FnType {
 				g.write('(${styp})builtin____as_cast(')
 			} else if g.inside_smartcast {
@@ -9819,7 +9950,11 @@ fn (mut g Gen) as_cast(node ast.AsCast) {
 			} else {
 				g.write('*(${styp}*)builtin____as_cast(')
 			}
-			g.write('(')
+			if is_inline_st {
+				g.write('&(')
+			} else {
+				g.write('(')
+			}
 			g.expr(node.expr)
 			g.write2(')', dot)
 			g.write2('_${sym.cname},', '(')

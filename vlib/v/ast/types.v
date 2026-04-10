@@ -300,12 +300,13 @@ pub mut:
 	found_fields bool
 	is_anon      bool
 	// generic sumtype support
-	is_generic     bool
-	variants       []Type
-	generic_types  []Type
-	concrete_types []Type
-	parent_type    Type
-	name_pos       token.Pos
+	is_generic       bool
+	variants         []Type
+	generic_types    []Type
+	concrete_types   []Type
+	parent_type      Type
+	name_pos         token.Pos
+	is_inline_storage bool // true when variants are stored inline (by value) in the union, not as heap-allocated pointers
 }
 
 pub fn (ti TypeInfo) get_name_pos() ?token.Pos {

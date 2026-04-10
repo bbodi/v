@@ -60,6 +60,7 @@ fn (mut g Gen) gen_sumtype_equality_fn(left_type ast.Type) string {
 	g.generated_eq_fns << left_no_ptr
 
 	info := left.sym.sumtype_info()
+	is_inline := info.is_inline_storage
 	g.definitions.writeln('bool ${ptr_styp}_sumtype_eq(${ptr_styp} a, ${ptr_styp} b);')
 
 	left_typ := g.read_field(left_type, '_typ', 'a')
@@ -77,36 +78,45 @@ fn (mut g Gen) gen_sumtype_equality_fn(left_type ast.Type) string {
 		left_arg := g.read_field(left_type, name, 'a')
 		right_arg := g.read_field(left_type, name, 'b')
 
+		// For inline storage, union members are values, not pointers — no dereference needed.
+		// For pointer-based storage, union members are pointers — dereference with *.
+		deref := if is_inline { '' } else { '*' }
+
 		if variant.typ.has_flag(.option) {
+			// option variants are always pointer-based
 			fn_builder.writeln('\t\treturn ((*${left_arg}).state == 2 && (*${right_arg}).state == 2) || !memcmp(&(*${left_arg}).data, &(*${right_arg}).data, sizeof(${g.base_type(variant.typ)}));')
 		} else if variant.sym.kind == .string {
-			fn_builder.writeln('\t\treturn builtin__string__eq(*${left_arg}, *${right_arg});')
+			fn_builder.writeln('\t\treturn builtin__string__eq(${deref}${left_arg}, ${deref}${right_arg});')
 		} else if variant.sym.kind == .sum_type && !typ.is_ptr() {
 			eq_fn := g.gen_sumtype_equality_fn(typ)
-			fn_builder.writeln('\t\treturn ${eq_fn}_sumtype_eq(*${left_arg}, *${right_arg});')
+			fn_builder.writeln('\t\treturn ${eq_fn}_sumtype_eq(${deref}${left_arg}, ${deref}${right_arg});')
 		} else if variant.sym.kind == .struct && !typ.is_ptr() {
 			eq_fn := g.gen_struct_equality_fn(typ)
-			fn_builder.writeln('\t\treturn ${eq_fn}_struct_eq(*${left_arg}, *${right_arg});')
+			fn_builder.writeln('\t\treturn ${eq_fn}_struct_eq(${deref}${left_arg}, ${deref}${right_arg});')
 		} else if variant.sym.kind == .array && !typ.is_ptr() {
 			eq_fn := g.gen_array_equality_fn(typ)
-			fn_builder.writeln('\t\treturn ${eq_fn}_arr_eq(*${left_arg}, *${right_arg});')
+			fn_builder.writeln('\t\treturn ${eq_fn}_arr_eq(${deref}${left_arg}, ${deref}${right_arg});')
 		} else if variant.sym.kind == .array_fixed && !typ.is_ptr() {
 			eq_fn := g.gen_fixed_array_equality_fn(typ)
-			fn_builder.writeln('\t\treturn ${eq_fn}_arr_eq(*${left_arg}, *${right_arg});')
+			fn_builder.writeln('\t\treturn ${eq_fn}_arr_eq(${deref}${left_arg}, ${deref}${right_arg});')
 		} else if variant.sym.kind == .map && !typ.is_ptr() {
 			eq_fn := g.gen_map_equality_fn(typ)
-			fn_builder.writeln('\t\treturn ${eq_fn}_map_eq(*${left_arg}, *${right_arg});')
+			fn_builder.writeln('\t\treturn ${eq_fn}_map_eq(${deref}${left_arg}, ${deref}${right_arg});')
 		} else if variant.sym.kind == .alias && !typ.is_ptr() {
 			if g.no_eq_method_types[typ] {
-				fn_builder.writeln('\t\treturn *${left_arg} == *${right_arg};')
+				fn_builder.writeln('\t\treturn ${deref}${left_arg} == ${deref}${right_arg};')
 			} else {
 				eq_fn := g.gen_alias_equality_fn(typ)
-				fn_builder.writeln('\t\treturn ${eq_fn}_alias_eq(*${left_arg}, *${right_arg});')
+				fn_builder.writeln('\t\treturn ${eq_fn}_alias_eq(${deref}${left_arg}, ${deref}${right_arg});')
 			}
 		} else if variant.sym.kind == .function {
-			fn_builder.writeln('\t\treturn *((voidptr*)(*${left_arg})) == *((voidptr*)(*${right_arg}));')
+			if is_inline {
+				fn_builder.writeln('\t\treturn *((voidptr*)(${left_arg})) == *((voidptr*)(${right_arg}));')
+			} else {
+				fn_builder.writeln('\t\treturn *((voidptr*)(*${left_arg})) == *((voidptr*)(*${right_arg}));')
+			}
 		} else {
-			fn_builder.writeln('\t\treturn *${left_arg} == *${right_arg};')
+			fn_builder.writeln('\t\treturn ${deref}${left_arg} == ${deref}${right_arg};')
 		}
 		fn_builder.writeln('\t}')
 	}

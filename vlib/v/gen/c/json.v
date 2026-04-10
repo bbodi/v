@@ -374,16 +374,21 @@ fn (mut g Gen) gen_option_enc_dec(typ ast.Type, mut enc strings.Builder, mut dec
 
 @[inline]
 fn (mut g Gen) gen_sumtype_variant_decode(variant_typ string, sumtype_cname string, ret_styp string,
-	prefix string, is_option bool, indent string, mut dec strings.Builder) {
+	prefix string, is_option bool, indent string, is_inline_sumtype bool, mut dec strings.Builder) {
 	tmp := g.new_tmp_var()
 	dec.writeln('${indent}${result_name}_${variant_typ} ${tmp} = ${js_dec_name(variant_typ)}(root);')
 	dec.writeln('${indent}if (${tmp}.is_error) {')
 	dec.writeln('${indent}\treturn (${result_name}_${ret_styp}){ .is_error = true, .err = ${tmp}.err, .data = {0} };')
 	dec.writeln('${indent}}')
-	if is_option {
-		dec.writeln('${indent}builtin___option_ok(&(${sumtype_cname}[]){ ${variant_typ}_to_sumtype_${sumtype_cname}((${variant_typ}*)${tmp}.data, false) }, (${option_name}*)&res, sizeof(${sumtype_cname}));')
+	cast_arg := if is_inline_sumtype {
+		'*(${variant_typ}*)${tmp}.data'
 	} else {
-		dec.writeln('${indent}${prefix}res = ${variant_typ}_to_sumtype_${sumtype_cname}((${variant_typ}*)${tmp}.data, false);')
+		'(${variant_typ}*)${tmp}.data, false'
+	}
+	if is_option {
+		dec.writeln('${indent}builtin___option_ok(&(${sumtype_cname}[]){ ${variant_typ}_to_sumtype_${sumtype_cname}(${cast_arg}) }, (${option_name}*)&res, sizeof(${sumtype_cname}));')
+	} else {
+		dec.writeln('${indent}${prefix}res = ${variant_typ}_to_sumtype_${sumtype_cname}(${cast_arg});')
 	}
 }
 
@@ -415,7 +420,11 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 		if fv_sym.kind == .struct && !is_option && field_op != '->' {
 			dec.writeln('\tif (root->type == cJSON_NULL) { ')
 			dec.writeln('\t\tstruct ${first_variant_name} empty = {0};')
-			dec.writeln('res = ${variant_typ}_to_sumtype_${ret_styp}(&empty, false); } \n else ')
+			if info.is_inline_storage {
+				dec.writeln('res = ${variant_typ}_to_sumtype_${ret_styp}(empty); } \n else ')
+			} else {
+				dec.writeln('res = ${variant_typ}_to_sumtype_${ret_styp}(&empty, false); } \n else ')
+			}
 			// dec.writeln('res = ${variant_typ}_to_sumtype_${sym.cname}(&empty, false); } \n else ')
 		}
 		//
@@ -460,43 +469,50 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 
 		// Helpers for decoding
 		g.get_sumtype_casting_fn(variant, typ)
-		g.definitions.writeln('static inline ${sym.cname} ${variant_typ}_to_sumtype_${sym.cname}(${variant_typ}* x, bool is_mut);')
+		if info.is_inline_storage {
+			g.definitions.writeln('static inline ${sym.cname} ${variant_typ}_to_sumtype_${sym.cname}(${variant_typ} x);')
+		} else {
+			g.definitions.writeln('static inline ${sym.cname} ${variant_typ}_to_sumtype_${sym.cname}(${variant_typ}* x, bool is_mut);')
+		}
 
 		// ENCODING
+		// For inline storage, union members are values — access directly.
+		// For pointer-based storage, dereference with *.
+		enc_deref := if info.is_inline_storage { '' } else { '*' }
 		enc.writeln('\tif (${var_data}${field_op}_typ == ${int(variant.idx())}) {')
 		$if json_no_inline_sumtypes ? {
 			if variant_sym.kind == .enum {
-				enc.writeln('\t\tcJSON_AddItemToObject(o, "${unmangled_variant_name}", ${js_enc_name('u64')}(*${var_data}${field_op}_${variant_typ}));')
+				enc.writeln('\t\tcJSON_AddItemToObject(o, "${unmangled_variant_name}", ${js_enc_name('u64')}(${enc_deref}${var_data}${field_op}_${variant_typ}));')
 			} else if variant_sym.name == 'time.Time' {
-				enc.writeln('\t\tcJSON_AddItemToObject(o, "${unmangled_variant_name}", ${js_enc_name('i64')}(time__Time_unix(*${var_data}${field_op}_${variant_typ})));')
+				enc.writeln('\t\tcJSON_AddItemToObject(o, "${unmangled_variant_name}", ${js_enc_name('i64')}(time__Time_unix(${enc_deref}${var_data}${field_op}_${variant_typ})));')
 			} else {
-				enc.writeln('\t\tcJSON_AddItemToObject(o, "${unmangled_variant_name}", ${js_enc_name(variant_typ)}(*${var_data}${field_op}_${variant_typ}));')
+				enc.writeln('\t\tcJSON_AddItemToObject(o, "${unmangled_variant_name}", ${js_enc_name(variant_typ)}(${enc_deref}${var_data}${field_op}_${variant_typ}));')
 			}
 		} $else {
 			if is_js_prim(variant_typ) {
-				enc.writeln('\t\tcJSON_free(o); return ${js_enc_name(variant_typ)}(*${var_data}${field_op}_${variant_typ});')
+				enc.writeln('\t\tcJSON_free(o); return ${js_enc_name(variant_typ)}(${enc_deref}${var_data}${field_op}_${variant_typ});')
 			} else if variant_sym.kind == .enum {
 				if g.is_enum_as_int(variant_sym) {
-					enc.writeln('\t\tcJSON_free(o); return ${js_enc_name('u64')}(*${var_data}${field_op}_${variant_typ});')
+					enc.writeln('\t\tcJSON_free(o); return ${js_enc_name('u64')}(${enc_deref}${var_data}${field_op}_${variant_typ});')
 				} else {
 					enc.writeln('\t\tcJSON_free(o);')
 					tmp2 := g.new_tmp_var()
 					if utyp.has_flag(.option) {
-						enc.writeln('\t\tu64 ${tmp2} = *${var_data}${field_op}_${variant_typ};')
+						enc.writeln('\t\tu64 ${tmp2} = ${enc_deref}${var_data}${field_op}_${variant_typ};')
 						g.gen_enum_to_str(variant, variant_sym, tmp2, 'o', '\t\t', mut
 							enc)
 					} else {
-						enc.writeln('\t\tu64 ${tmp2} = *${var_data}${field_op}_${variant_typ};')
+						enc.writeln('\t\tu64 ${tmp2} = ${enc_deref}${var_data}${field_op}_${variant_typ};')
 						g.gen_enum_to_str(variant, variant_sym, tmp2, 'o', '\t\t', mut
 							enc)
 					}
 				}
 			} else if variant_sym.name == 'time.Time' {
 				enc.writeln('\t\tcJSON_AddItemToObject(o, "_type", cJSON_CreateString("${unmangled_variant_name}"));')
-				enc.writeln('\t\tcJSON_AddItemToObject(o, "value", ${js_enc_name('i64')}(time__Time_unix(*${var_data}${field_op}_${variant_typ})));')
+				enc.writeln('\t\tcJSON_AddItemToObject(o, "value", ${js_enc_name('i64')}(time__Time_unix(${enc_deref}${var_data}${field_op}_${variant_typ})));')
 			} else {
 				enc.writeln('\t\tcJSON_free(o);')
-				enc.writeln('\t\to = ${js_enc_name(variant_typ)}(*${var_data}${field_op}_${variant_typ});')
+				enc.writeln('\t\to = ${js_enc_name(variant_typ)}(${enc_deref}${var_data}${field_op}_${variant_typ});')
 				if variant_sym.kind == .array {
 					enc.writeln('\t\tif (cJSON_IsObject(o->child)) {')
 					enc.writeln('\t\t\tcJSON_AddItemToObject(o->child, "_type", cJSON_CreateString("${unmangled_variant_name}"));')
@@ -510,6 +526,8 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 
 		// DECODING
 		tmp := g.new_tmp_var()
+		// For inline storage, pass value; for pointer-based, pass &value
+		cast_value_arg := if info.is_inline_storage { 'value' } else { '&value, false' }
 		$if json_no_inline_sumtypes ? {
 			dec.writeln('\tif (strcmp("${unmangled_variant_name}", root->child->string) == 0) {')
 			if is_js_prim(variant_typ) {
@@ -536,9 +554,9 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 				dec.writeln('\t\t${variant_typ} value = *(${variant_typ}*)(${tmp}.data);')
 			}
 			if is_option {
-				dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${variant_typ}_to_sumtype_${sym.cname}(&value, false) }, (${option_name}*)&res, sizeof(${sym.cname}));')
+				dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${variant_typ}_to_sumtype_${sym.cname}(${cast_value_arg}) }, (${option_name}*)&res, sizeof(${sym.cname}));')
 			} else {
-				dec.writeln('\t\tres = ${variant_typ}_to_sumtype_${ret_styp}(&value, false);')
+				dec.writeln('\t\tres = ${variant_typ}_to_sumtype_${ret_styp}(${cast_value_arg});')
 			}
 			dec.writeln('\t}')
 		} $else {
@@ -549,16 +567,19 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 				if utyp.has_flag(.option) {
 					dec.writeln('\t\t\t\t${prefix}res.state = 0;')
 					tmp_time_var := g.new_tmp_var()
-					dec.writeln('\t\t\t\t${g.base_type(utyp)} ${tmp_time_var} = ${variant_typ}_to_sumtype_${sym.cname}(&${tmp}, false);')
-					dec.writeln('\t\t\t\tbuiltin__vmemcpy(&${prefix}res.data, ${tmp_time_var}._time__Time, sizeof(${variant_typ}));')
+					time_cast_arg := if info.is_inline_storage { '${tmp}' } else { '&${tmp}, false' }
+					dec.writeln('\t\t\t\t${g.base_type(utyp)} ${tmp_time_var} = ${variant_typ}_to_sumtype_${sym.cname}(${time_cast_arg});')
+					time_access := if info.is_inline_storage { '&${tmp_time_var}._time__Time' } else { '${tmp_time_var}._time__Time' }
+					dec.writeln('\t\t\t\tbuiltin__vmemcpy(&${prefix}res.data, ${time_access}, sizeof(${variant_typ}));')
 				} else {
-					dec.writeln('\t\t\t\t${prefix}res = ${variant_typ}_to_sumtype_${sym.cname}(&${tmp}, false);')
+					time_cast_arg2 := if info.is_inline_storage { '${tmp}' } else { '&${tmp}, false' }
+					dec.writeln('\t\t\t\t${prefix}res = ${variant_typ}_to_sumtype_${sym.cname}(${time_cast_arg2});')
 				}
 				dec.writeln('\t\t\t}')
 			} else if !is_js_prim(variant_typ) && variant_sym.kind != .enum {
 				dec.writeln('\t\t\tif (strcmp("${unmangled_variant_name}", ${type_var}) == 0 && ${variant_sym.kind == .array} == cJSON_IsArray(root)) {')
 				g.gen_sumtype_variant_decode(variant_typ, sym.cname, ret_styp, prefix,
-					is_option, '\t\t\t\t', mut dec)
+					is_option, '\t\t\t\t', info.is_inline_storage, mut dec)
 				dec.writeln('\t\t\t}')
 			}
 		}
@@ -572,13 +593,13 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 			if object_like_variant_count == 1 {
 				dec.writeln('\t\t\tif (cJSON_IsObject(root)) {')
 				g.gen_sumtype_variant_decode(object_like_variant_typ, sym.cname, ret_styp,
-					prefix, is_option, '\t\t\t\t', mut dec)
+					prefix, is_option, '\t\t\t\t', info.is_inline_storage, mut dec)
 				dec.writeln('\t\t\t}')
 			}
 			if array_like_variant_count == 1 {
 				dec.writeln('\t\t\tif (cJSON_IsArray(root)) {')
 				g.gen_sumtype_variant_decode(array_like_variant_typ, sym.cname, ret_styp,
-					prefix, is_option, '\t\t\t\t', mut dec)
+					prefix, is_option, '\t\t\t\t', info.is_inline_storage, mut dec)
 				dec.writeln('\t\t\t}')
 			}
 			dec.writeln('\t\t}')
@@ -591,11 +612,13 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 		if at_least_one_prim {
 			dec.writeln('\t} else {')
 
+			// For inline storage, pass value; for pointer-based, pass &value
+			prim_cast_arg := if info.is_inline_storage { 'value' } else { '&value, false' }
 			if 'bool' in variant_types {
 				var_t := 'bool'
 				dec.writeln('\t\tif (cJSON_IsBool(root)) {')
 				dec.writeln('\t\t\t${var_t} value = ${js_dec_name(var_t)}(root);')
-				dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(&value, false);')
+				dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(${prim_cast_arg});')
 				dec.writeln('\t\t}')
 			}
 
@@ -611,9 +634,9 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 					dec.writeln('\t\tif (cJSON_IsNumber(root)) {')
 					dec.writeln('\t\t\t${var_t} value = ${js_dec_name('u64')}(root);')
 					if utyp.has_flag(.option) {
-						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}(&value, false) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
+						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}(${prim_cast_arg}) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
 					} else {
-						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(&value, false);')
+						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(${prim_cast_arg});')
 					}
 					dec.writeln('\t\t}')
 				}
@@ -627,9 +650,9 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 					dec.writeln('\t\tif (cJSON_IsString(root)) {')
 					dec.writeln('\t\t\t${var_t} value = ${js_dec_name(var_t)}(root);')
 					if utyp.has_flag(.option) {
-						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}(&value, false) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
+						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}(${prim_cast_arg}) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
 					} else {
-						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(&value, false);')
+						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(${prim_cast_arg});')
 					}
 					dec.writeln('\t\t}')
 				}
@@ -650,10 +673,15 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 					dec.writeln('\t\t\tif (${tmp}.is_error) {')
 					dec.writeln('\t\t\t\treturn (${result_name}_${ret_styp}){ .is_error = true, .err = ${tmp}.err, .data = {0} };')
 					dec.writeln('\t\t\t}')
-					if utyp.has_flag(.option) {
-						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}((${var_t}*)${tmp}.data, false) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
+					arr_cast_arg := if info.is_inline_storage {
+						'*(${var_t}*)${tmp}.data'
 					} else {
-						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}((${var_t}*)${tmp}.data, false);')
+						'(${var_t}*)${tmp}.data, false'
+					}
+					if utyp.has_flag(.option) {
+						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}(${arr_cast_arg}) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
+					} else {
+						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(${arr_cast_arg});')
 					}
 					dec.writeln('\t\t}')
 				}
@@ -670,9 +698,9 @@ fn (mut g Gen) gen_sumtype_enc_dec(utyp ast.Type, sym ast.TypeSymbol, mut enc st
 					dec.writeln('\t\tif (cJSON_IsNumber(root)) {')
 					dec.writeln('\t\t\t${var_t} value = ${js_dec_name(var_t)}(root);')
 					if utyp.has_flag(.option) {
-						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}(&value, false) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
+						dec.writeln('\t\t\tbuiltin___option_ok(&(${sym.cname}[]){ ${var_t}_to_sumtype_${sym.cname}(${prim_cast_arg}) }, (${option_name}*)&${prefix}res, sizeof(${sym.cname}));')
 					} else {
-						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(&value, false);')
+						dec.writeln('\t\t\t${prefix}res = ${var_t}_to_sumtype_${sym.cname}(${prim_cast_arg});')
 					}
 					dec.writeln('\t\t}')
 				}

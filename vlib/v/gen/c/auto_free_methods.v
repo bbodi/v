@@ -124,6 +124,7 @@ fn (mut g Gen) gen_free_for_interface(sym ast.TypeSymbol, info ast.Interface, st
 }
 
 fn (mut g Gen) gen_free_for_sumtype(info ast.SumType, styp string, fn_name string) {
+	is_inline := info.is_inline_storage
 	g.definitions.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it);')
 	mut fn_builder := strings.new_builder(256)
 	defer {
@@ -139,7 +140,12 @@ fn (mut g Gen) gen_free_for_sumtype(info ast.SumType, styp string, fn_name strin
 		free_typ := variant.clear_flag(.option)
 		free_sym := g.table.sym(g.unwrap_generic(free_typ))
 		variant_name := g.get_sumtype_variant_name(variant, free_sym)
-		variant_ptr := 'it->_${variant_name}'
+		// For inline storage, take address of the inline value; for pointer-based, use the pointer directly
+		variant_ptr := if is_inline && !variant.has_flag(.option) {
+			'&it->_${variant_name}'
+		} else {
+			'it->_${variant_name}'
+		}
 		fn_builder.writeln('\tif (it->_typ == ${g.type_sidx(variant)}) {')
 		if variant.has_flag(.option) {
 			match free_sym.kind {
@@ -182,8 +188,10 @@ fn (mut g Gen) gen_free_for_sumtype(info ast.SumType, styp string, fn_name strin
 				else {}
 			}
 		}
-		// Sumtypes box their active payload in heap memory via memdup/HEAP.
-		fn_builder.writeln('\t\tbuiltin___v_free(${variant_ptr});')
+		if !is_inline || variant.has_flag(.option) {
+			// Only free heap allocation for pointer-based storage (or option variants which are always pointers)
+			fn_builder.writeln('\t\tbuiltin___v_free(${variant_ptr});')
+		}
 		fn_builder.writeln('\t\treturn;')
 		fn_builder.writeln('\t}')
 	}

@@ -5967,7 +5967,14 @@ fn (mut c Checker) smartcast(mut expr ast.Expr, cur_type ast.Type, to_type_ ast.
 				smartcasts << expr.obj.smartcasts
 				is_already_casted = expr.obj.pos.pos == expr.pos.pos
 				if orig_type == 0 {
-					orig_type = expr.obj.typ
+					// For multi-level smartcasts, preserve the root original type
+					// from the first smartcast level rather than using the intermediate
+					// type from the previous scope level.
+					orig_type = if expr.obj.orig_type != 0 {
+						expr.obj.orig_type
+					} else {
+						expr.obj.typ
+					}
 				}
 				is_inherited = expr.obj.is_inherited
 				ct_type_var = if is_comptime {

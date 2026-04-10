@@ -808,6 +808,80 @@ pub fn (t &Table) resolve_common_sumtype_fields(mut sym TypeSymbol) {
 	}
 }
 
+// resolve_sumtype_storage_mode determines whether a sum type can use inline (by-value)
+// storage in its C union, or must use pointer-based (heap-allocated) storage.
+// Recursive sum types (where a variant struct contains the sum type as a non-pointer field)
+// must use pointer-based storage because C cannot compute the size of such a struct.
+pub fn (t &Table) resolve_sumtype_storage_mode(mut sym TypeSymbol) {
+	mut info := sym.info as SumType
+	if info.is_inline_storage {
+		return
+	}
+	// Inline sum types with common fields use interior pointers that become
+	// dangling when the struct is returned by value or copied. Fall back to
+	// pointer-based storage when common fields exist.
+	if info.fields.len > 0 {
+		return
+	}
+	mut all_inline := true
+	for variant in info.variants {
+		if variant.has_flag(.option) {
+			continue
+		}
+		mut visited := map[int]bool{}
+		visited[sym.idx] = true
+		if t.variant_contains_sumtype(variant, sym.idx, mut visited) {
+			all_inline = false
+			break
+		}
+	}
+	info.is_inline_storage = all_inline
+	sym.info = info
+	if sym.idx > 0 {
+		mut mut_table := unsafe { &Table(t) }
+		mut_table.type_symbols[sym.idx].info = info
+	}
+}
+
+// variant_contains_sumtype checks whether a type transitively contains the given
+// sum type index through non-pointer fields. Pointer-typed fields break the cycle
+// and are safe for C struct layout.
+fn (t &Table) variant_contains_sumtype(variant_type Type, sumtype_idx int, mut visited map[int]bool) bool {
+	if variant_type.is_ptr() {
+		return false
+	}
+	variant_sym := t.sym(variant_type)
+	match variant_sym.info {
+		Struct {
+			for field in t.struct_fields(variant_sym) {
+				if field.typ.is_ptr() {
+					continue
+				}
+				field_idx := field.typ.idx()
+				if field_idx == sumtype_idx {
+					return true
+				}
+				if field_idx in visited {
+					continue
+				}
+				visited[field_idx] = true
+				if t.variant_contains_sumtype(field.typ, sumtype_idx, mut visited) {
+					return true
+				}
+			}
+		}
+		SumType {
+			for nested_variant in variant_sym.info.variants {
+				if t.variant_contains_sumtype(nested_variant, sumtype_idx, mut visited) {
+					return true
+				}
+			}
+		}
+		else {}
+	}
+	return false
+}
+
 // find_single_field_variant returns a field that exists in exactly one aggregate or sumtype variant.
 pub fn (t &Table) find_single_field_variant(sym &TypeSymbol, field_name string) !(Type, StructField, []Type) {
 	variants := match sym.info {

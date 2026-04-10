@@ -524,7 +524,15 @@ fn (mut g Gen) gen_str_for_union_sum_type(info ast.SumType, styp string, typ_str
 
 		// str_intp
 		if typ == ast.string_type {
-			mut val := '${func_name}(${deref}(${typ_name}*)x._${sym.cname}'
+			mut val := if info.is_inline_storage {
+				if deref == '*' {
+					'${func_name}(x._${sym.cname}'
+				} else {
+					'${func_name}(&x._${sym.cname}'
+				}
+			} else {
+				'${func_name}(${deref}(${typ_name}*)x._${sym.cname}'
+			}
 			if should_use_indent_func(sym.kind) && !sym_has_str_method {
 				val += ', indent_count'
 			}
@@ -535,8 +543,16 @@ fn (mut g Gen) gen_str_for_union_sum_type(info ast.SumType, styp string, typ_str
 			}))'
 			fn_builder.write_string('\t\tcase ${int(typ)}: return ${res};\n')
 		} else {
-			mut val := '${func_name}(${deref}(${typ_name}*)x._${g.get_sumtype_variant_name(typ,
-				sym)}'
+			variant_name := g.get_sumtype_variant_name(typ, sym)
+			mut val := if info.is_inline_storage {
+				if deref == '*' {
+					'${func_name}(x._${variant_name}'
+				} else {
+					'${func_name}(&x._${variant_name}'
+				}
+			} else {
+				'${func_name}(${deref}(${typ_name}*)x._${variant_name}'
+			}
 			if should_use_indent_func(sym.kind) && !sym_has_str_method {
 				val += ', indent_count'
 			}
